@@ -273,6 +273,13 @@ static inline bool nvmet_rdma_need_data_out(struct nvmet_rdma_rsp *rsp)
 		!(rsp->flags & NVMET_RDMA_REQ_INLINE_DATA);
 }
 
+static inline bool nvmet_rdma_use_own_rq(struct nvmet_rdma_queue *queue)
+{
+	return queue->offload
+		? !(queue->dev->srqs || queue->xrq)
+		: !(nvmet_rdma_use_srq && queue->dev->srqs);
+}
+
 static inline struct nvmet_rdma_rsp *
 nvmet_rdma_get_rsp(struct nvmet_rdma_queue *queue)
 {
@@ -1337,15 +1344,6 @@ static int nvmet_rdma_create_queue_ib(struct nvmet_rdma_queue *queue)
 	struct nvmet_rdma_device *ndev = queue->dev;
 	int nr_cqe, ret, i, factor;
 
-	if (queue->offload && !ndev->rts2rts_qp_rmp) {
-		ret = nvmet_rdma_find_get_xrq(queue, NULL);
-		if (ret) {
-			pr_err("failed to get XRQ for queue (%d)\n",
-			       queue->host_qid);
-			goto out;
-		}
-	}
-
 	/*
 	 * Reserve CQ slots for RECV + RDMA_READ/RDMA_WRITE + RDMA_SEND.
 	 */
@@ -1357,7 +1355,7 @@ static int nvmet_rdma_create_queue_ib(struct nvmet_rdma_queue *queue)
 		ret = PTR_ERR(queue->cq);
 		pr_err("failed to create CQ cqe= %d ret= %d\n",
 		       nr_cqe + 1, ret);
-		goto err_destroy_xrq;
+		goto out;
 	}
 
 	memset(&qp_attr, 0, sizeof(qp_attr));
@@ -1377,7 +1375,7 @@ static int nvmet_rdma_create_queue_ib(struct nvmet_rdma_queue *queue)
 	if (queue->xrq) {
 		qp_attr.srq = queue->xrq->ofl_srq->srq;
 		qp_attr.recv_cq = NULL;
-	} else if (queue->nsrq) {
+	} else if ((nvmet_rdma_use_srq || queue->offload) && queue->nsrq) {
 		qp_attr.srq = queue->nsrq->srq;
 		qp_attr.recv_cq = queue->cq;
 	} else {
@@ -1403,7 +1401,7 @@ static int nvmet_rdma_create_queue_ib(struct nvmet_rdma_queue *queue)
 		 __func__, queue->cq->cqe, qp_attr.cap.max_send_sge,
 		 qp_attr.cap.max_send_wr, queue->cm_id);
 
-	if (!queue->nsrq && !queue->xrq) {
+	if (nvmet_rdma_use_own_rq(queue)) {
 		for (i = 0; i < queue->recv_queue_size; i++) {
 			queue->cmds[i].queue = queue;
 			ret = nvmet_rdma_post_recv(ndev, &queue->cmds[i]);
@@ -1419,9 +1417,6 @@ err_destroy_qp:
 	rdma_destroy_qp(queue->cm_id);
 err_destroy_cq:
 	ib_cq_pool_put(queue->cq, nr_cqe + 1);
-err_destroy_xrq:
-	if (queue->xrq)
-		kref_put(&queue->xrq->ref, nvmet_rdma_destroy_xrq);
 	goto out;
 }
 
@@ -1445,7 +1440,7 @@ static void nvmet_rdma_free_queue(struct nvmet_rdma_queue *queue)
 	nvmet_sq_destroy(&queue->nvme_sq);
 
 	nvmet_rdma_destroy_queue_ib(queue);
-	if (!queue->nsrq && !queue->offload) {
+	if (nvmet_rdma_use_own_rq(queue)) {
 		nvmet_rdma_free_cmds(queue->dev, queue->cmds,
 				queue->recv_queue_size,
 				!queue->host_qid);
@@ -1585,16 +1580,25 @@ nvmet_rdma_alloc_queue(struct nvmet_rdma_device *ndev,
 		goto out_ida_remove;
 	}
 
-	if (ndev->srqs) {
-		queue->nsrq = ndev->srqs[queue->comp_vector % ndev->srq_count];
-	} else if(!queue->nsrq && !queue->offload) {
+	if (queue->offload && !ndev->rts2rts_qp_rmp) {
+		ret = nvmet_rdma_find_get_xrq(queue, NULL);
+		if (ret) {
+			pr_err("failed to get XRQ for queue (%d)\n",
+			       queue->host_qid);
+			goto out_free_responses;
+		}
+	}
+
+	if (nvmet_rdma_use_own_rq(queue)) {
 		queue->cmds = nvmet_rdma_alloc_cmds(ndev,
 				queue->recv_queue_size,
 				!queue->host_qid);
 		if (IS_ERR(queue->cmds)) {
 			ret = NVME_RDMA_CM_NO_RSC;
-			goto out_free_responses;
+			goto out_destroy_xrq;
 		}
+	} else if (!queue->xrq && ndev->srqs) {
+		queue->nsrq = ndev->srqs[queue->comp_vector % ndev->srq_count];
 	}
 
 	ret = nvmet_rdma_create_queue_ib(queue);
@@ -1608,11 +1612,14 @@ nvmet_rdma_alloc_queue(struct nvmet_rdma_device *ndev,
 	return queue;
 
 out_free_cmds:
-	if (!queue->nsrq && !queue->offload) {
+	if (nvmet_rdma_use_own_rq(queue)) {
 		nvmet_rdma_free_cmds(queue->dev, queue->cmds,
 				queue->recv_queue_size,
 				!queue->host_qid);
 	}
+out_destroy_xrq:
+	if (queue->xrq)
+		kref_put(&queue->xrq->ref, nvmet_rdma_destroy_xrq);
 out_free_responses:
 	nvmet_rdma_free_rsps(queue);
 out_ida_remove:
