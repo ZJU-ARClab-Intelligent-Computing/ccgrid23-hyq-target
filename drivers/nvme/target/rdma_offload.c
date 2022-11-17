@@ -358,8 +358,11 @@ static u16 nvmet_rdma_install_offload_queue(struct nvmet_sq *sq)
 	}
 
 	ret = ib_modify_qp(queue->cm_id->qp, &attr, qp_attr_mask);
-	if (ret)
+	if (ret) {
+		pr_err("failed to modify qp (%d), ret=%d\n",
+			       queue->host_qid, ret);
 		return NVME_SC_INTERNAL | NVME_SC_DNR;
+	}
 	return 0;
 }
 
