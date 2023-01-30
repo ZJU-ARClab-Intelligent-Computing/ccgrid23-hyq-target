@@ -30,6 +30,8 @@
 #include "nvmet.h"
 #include "rdma_offload.h"
 
+#define NVME_RDMA_CM_FMT_OFFLOAD 0xFFFF
+
 /*
  * We allow at least 1 page, up to 4 SGEs, and up to 16KB of inline data
  */
@@ -1480,8 +1482,12 @@ nvmet_rdma_parse_cm_connect_req(struct rdma_conn_param *conn,
 	if (!req || conn->private_data_len == 0)
 		return NVME_RDMA_CM_INVALID_LEN;
 
-	if (le16_to_cpu(req->recfmt) != NVME_RDMA_CM_FMT_1_0)
+	queue->offload = false;
+	if (le16_to_cpu(req->recfmt) == NVME_RDMA_CM_FMT_OFFLOAD) {
+		queue->offload = true;
+	} else if (le16_to_cpu(req->recfmt) != NVME_RDMA_CM_FMT_1_0) {
 		return NVME_RDMA_CM_INVALID_RECFMT;
+	}
 
 	queue->host_qid = le16_to_cpu(req->qid);
 
@@ -1549,7 +1555,7 @@ nvmet_rdma_alloc_queue(struct nvmet_rdma_device *ndev,
 	queue->dev = ndev;
 	queue->cm_id = cm_id;
 	queue->port = port->nport;
-	queue->offload = queue->port->offload && queue->host_qid;
+	queue->offload = queue->port->offload && queue->host_qid && queue->offload;
 
 	spin_lock_init(&queue->state_lock);
 	queue->state = NVMET_RDMA_Q_CONNECTING;
