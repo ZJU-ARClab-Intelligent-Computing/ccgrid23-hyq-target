@@ -84,7 +84,7 @@ GTAGS
 *~
 \#*#
 configure.mk.kernel
-# compat.config
+compat.config
 include/linux/autoconf.h
 include/generated/autoconf.h
 include/linux/compat_autoconf.h
